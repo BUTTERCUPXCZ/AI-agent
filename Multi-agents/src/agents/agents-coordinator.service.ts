@@ -16,51 +16,8 @@ export class AgentCoordinatorService {
   ) {}
 
   async processUserInput(input: string) {
-  // Store user message in memory (if not first/empty message)
-  if (input.length > 0) {
-    this.memory.addUserMessage(input);
-    
-    // SAFETY CHECK
-    const safety = await this.safety.checkSafety(input);
-    if (!safety.safe) {
-      return {
-        message: `I feel like something is off... let's pause 😔 (${safety.reason})`,
-        stop: true,
-      };
-    }
-
-    // ENERGY ANALYSIS
-    const energyResult = await this.energy.analyzeEnergy(input);
-    
-    if (energyResult) {
-      const { energy, type, emotion } = energyResult;
-
-      // Safety checks for low energy/distress
-      if (energy === 'low') {
-        return {
-          message: "Baby... your energy feels really low. Let's pause, okay? 🫶",
-          stop: true,
-        };
-      }
-
-      if (type === 'distressed') {
-        return {
-          message: "Baby… you sound distressed. I don't want to continue like this 😔",
-          stop: true,
-        };
-      }
-
-      if (emotion === 'sad' || emotion === 'overwhelmed') {
-        return {
-          message: "Aww baby... you're not okay right now. Let's take a break 💗",
-          stop: true,
-        };
-      }
-
-      // GET RESPONSE TONE BASED ON ENERGY
-      const responseTone = await this.energy.getResponseTone(input);
-
-      // GET NEXT SCRIPT LINE
+    // === FIRST MESSAGE (no user input yet) ===
+    if (input.length === 0) {
       const nextScript = this.scripts.getNext();
       if (!nextScript) {
         return { 
@@ -69,52 +26,211 @@ export class AgentCoordinatorService {
         };
       }
 
-      // GET CONVERSATION CONTEXT
-      const history = this.memory.getFormattedHistory();
-      const lastUserMessage = this.memory.getLastUserMessage() || input;
-
-      // GENERATE CONTEXTUAL RESPONSE
       const styled = await this.personality.stylize(
         nextScript,
-        history,
-        lastUserMessage,
-        responseTone,
-        energyResult
+        '',
+        '',
+        { 
+          magnitude: 'medium',
+          quality: 'warm',
+          direction: 'giving',
+          engagement: 'fully_present',
+          nervousSystem: 'calm',
+          emotion: 'happy',
+          cooperation: 'cooperative',
+          timestamp: Date.now()
+        },
+        null,
+        { 
+          shouldContinue: true,
+          energyToMatch: 'medium',
+          tone: 'playful',
+          style: 'warm and inviting',
+          suggestions: ['be sweet', 'be yourself']
+        },
+        false
       );
 
-      // Store agent response in memory
       this.memory.addAgentMessage(styled);
+      return { message: styled, stop: false };
+    }
 
+    // === STORE USER MESSAGE ===
+    this.memory.addUserMessage(input);
+
+    // === QUICK SAFETY CHECK ===
+    const quickCheck = this.safety.quickCheck(input);
+    if (quickCheck && quickCheck.shouldStop) {
       return {
-        message: styled,
-        stop: false,
+        message: quickCheck.responseMessage,
+        stop: true,
+        reason: quickCheck.reason
       };
     }
+
+    // === ENERGY ANALYSIS ===
+    const energyState = await this.energy.analyzeEnergy(input);
+    const energyShift = this.energy.detectEnergyShift();
+   
+
+   
+    const safetyResult = await this.safety.checkSafety(
+      input,
+      energyState,
+      energyShift,
+      this.memory.getFormattedHistory()
+    );
+
+    if (safetyResult.shouldStop) {
+      const stopMessage = safetyResult.responseMessage || 
+        await this.personality.generateStopMessage(
+          safetyResult.reason,
+          energyState,
+          true
+        );
+      return {
+        message: stopMessage,
+        stop: true,
+        reason: safetyResult.reason,
+        flags: safetyResult.flags
+      };
+    }
+
+    // === CHECK ENERGY PATTERN ===
+    const patternCheck = this.safety.shouldEndBasedOnPattern(
+      this.energy.getEnergyHistory()
+    );
+
+    if (patternCheck.shouldEnd) {
+      const stopMessage = await this.personality.generateStopMessage(
+        patternCheck.reason,
+        energyState,
+        true
+      );
+      return {
+        message: stopMessage,
+        stop: true,
+        reason: patternCheck.reason
+      };
+    }
+
+    // === GET RESPONSE TONE BASED ON ENERGY ===
+    const responseTone = await this.energy.generateResponseTone(
+      energyState,
+      energyShift
+    );
+
+    // Only check in if there's a SERIOUS energy problem and not already checking in
+    const shouldCheckIn = !responseTone.shouldContinue && 
+                          energyShift?.severity === 'critical' &&
+                          energyState.magnitude !== 'medium' &&
+                          energyState.magnitude !== 'high';
+
+    if (shouldCheckIn) {
+      const checkIn = await this.personality.stylize(
+        null,
+        this.memory.getFormattedHistory(),
+        input,
+        energyState,
+        energyShift,
+        responseTone,
+        true // shouldCheckIn = true
+      );
+
+      this.memory.addAgentMessage(checkIn);
+      return {
+        message: checkIn,
+        stop: false,
+        paused: true,
+        reason: 'Critical energy shift - checking in before continuing'
+      };
+    }
+
+    // If we should pause (from quick check)
+    if (safetyResult.shouldPause) {
+      const checkIn = await this.personality.stylize(
+        null,
+        this.memory.getFormattedHistory(),
+        input,
+        energyState,
+        energyShift,
+        responseTone,
+        true
+      );
+
+      this.memory.addAgentMessage(checkIn);
+      return {
+        message: checkIn,
+        stop: false,
+        paused: true,
+        reason: safetyResult.reason
+      };
+    }
+
+    // === CONTINUE WITH SCRIPT ===
+    const nextScript = this.scripts.getNext();
+    
+    if (!nextScript) {
+      return { 
+        message: "That's everything I wanted to say, baby 💕", 
+        stop: true 
+      };
+    }
+
+    const styled = await this.personality.stylize(
+      nextScript,
+      this.memory.getFormattedHistory(),
+      input,
+      energyState,
+      energyShift,
+      responseTone,
+      false
+    );
+
+    this.memory.addAgentMessage(styled);
+
+    return {
+      message: styled,
+      stop: false,
+      energyState,
+      energyShift,
+      warnings: responseTone.warnings || []
+    };
   }
 
-  // FIRST MESSAGE (no user input yet)
-  const nextScript = this.scripts.getNext();
-  if (!nextScript) {
-    return { message: "That's everything I wanted to say, baby 💕", stop: true };
+  // Reset for new conversation
+  reset() {
+    this.scripts.reset();
+    this.memory.reset();
+    // Energy history stays - could be useful for multi-session learning
   }
 
-  const styled = await this.personality.stylize(
-    nextScript,
-    '',
-    '',
-    { 
-      energyLevel: 'balanced', 
-      style: 'warm and inviting', 
-      suggestions: ['be sweet', 'be yourself'] 
-    },
-    { energy: 'medium', type: 'cooperative', emotion: 'neutral' }
-  );
+  // Get insights about the conversation
+  getConversationInsights() {
+    const energyHistory = this.energy.getEnergyHistory();
+    const baseline = this.energy.compareToBaseline();
+    
+    return {
+      totalMessages: energyHistory.length,
+      baseline: baseline,
+      energyPattern: energyHistory.map(e => ({
+        magnitude: e.magnitude,
+        engagement: e.engagement,
+        emotion: e.emotion
+      })),
+      conversationHealth: this.assessConversationHealth(energyHistory)
+    };
+  }
 
-  this.memory.addAgentMessage(styled);
-
-  return {
-    message: styled,
-    stop: false,
-  };
+  private assessConversationHealth(history: any[]) {
+    if (history.length < 3) return 'establishing';
+    
+    const recent = history.slice(-3);
+    const engaged = recent.filter(e => e.engagement === 'fully_present').length;
+    const highEnergy = recent.filter(e => e.magnitude === 'high' || e.magnitude === 'medium').length;
+    
+    if (engaged >= 2 && highEnergy >= 2) return 'healthy';
+    if (engaged === 0) return 'critical';
+    return 'concerning';
+  }
 }
-}   
